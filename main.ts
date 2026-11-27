@@ -11,7 +11,7 @@
 // transparent-key tRNS form where one exists), pick a per-row filter for
 // each form under several strategies, screen the candidates with zlib
 // level 6, then compress the finalists with zlib level 9 variants and with a
-// hand-written four-pass DEFLATE encoder (two lazy parses, then two
+// hand-written DEFLATE encoder (one lazy parse, then one or two
 // optimal-parse passes in the manner of zopfli, plus an all-candidates or
 // plus-8 pass per stream size), keeping the smallest.
 
@@ -882,6 +882,15 @@ function hash3(data: Uint8Array, pos: number): number {
   return (((data[pos] * 131 + data[pos + 1]) * 131 + data[pos + 2]) & 0xffff) >>> 0;
 }
 
+// Iter 9: four-byte hash into 2^17 buckets. Chains hold only positions
+// sharing the first four bytes, so they are far shorter than hash3 chains
+// on repetitive screenshot data; a position sharing only three bytes can
+// only give a length-3 match, and those are recovered by the hash3 walk
+// whenever no length-4 match exists.
+function hash4(data: Uint8Array, pos: number): number {
+  return ((((data[pos] * 131 + data[pos + 1]) * 131 + data[pos + 2]) * 131 + data[pos + 3]) & 0x1ffff) >>> 0;
+}
+
 interface Match {
   len: number;
   dist: number;
@@ -890,15 +899,21 @@ interface Match {
 class Matcher {
   head: Int32Array;
   prev: Int32Array;
+  // Iter 9: parallel four-byte chains (see hash4).
+  head4: Int32Array;
+  prev4: Int32Array;
   data: Uint8Array;
   inserted = 0;
   constructor(data: Uint8Array) {
     this.data = data;
     this.head = new Int32Array(65536).fill(-1);
     this.prev = new Int32Array(data.length).fill(-1);
+    this.head4 = new Int32Array(131072).fill(-1);
+    this.prev4 = new Int32Array(data.length).fill(-1);
   }
   reset(): void {
     this.head.fill(-1);
+    this.head4.fill(-1);
     this.inserted = 0;
   }
   // Insert every position below pos into the chains, so the head of a
@@ -910,6 +925,11 @@ class Matcher {
       const h = hash3(data, i);
       this.prev[i] = this.head[h];
       this.head[h] = i;
+      if (i + 3 < data.length) {
+        const h4 = hash4(data, i);
+        this.prev4[i] = this.head4[h4];
+        this.head4[h4] = i;
+      }
     }
     if (pos > this.inserted) this.inserted = pos;
   }
@@ -953,21 +973,30 @@ class Matcher {
   // DP can iterate breakpoints instead of scanning all 256 lengths.
   pareto = new Int32Array(259);
   paretoCount = 0;
-  bestSublen(pos: number, maxChain: number, sublen: Int32Array): Match | null {
+  // Iter 9: walk one candidate chain, filling sublen/pareto with the
+  // longest match plus, for each length, the smallest distance of a match
+  // reaching at least that length. Candidates are walked newest-first
+  // (smallest distance first), so the first candidate to reach a length
+  // is the cheapest distance for it. Two bounded shortcuts, both OFF by
+  // default (caps 0): stagCap breaks after that many consecutive
+  // non-improving candidates; earlyCap breaks once the best length
+  // reaches the threshold. parseOptimal enables them only for the
+  // all-candidates pass (see there): the seed/plus-8 optimal passes must
+  // reproduce the lazy seed's deep-chain matches — capping them collapses
+  // the DP to literals (measured: optimal stream 49.9K -> 245K).
+  walkChain(cand: number, pos: number, maxChain: number, sublen: Int32Array, prevArr: Int32Array, stagCap = 0, earlyCap = 0): [number, number] {
     const data = this.data;
     const n = data.length;
-    if (pos + 3 > n) return null;
-    this.insertUpTo(pos);
-    this.paretoCount = 0;
-    let cand = this.head[hash3(data, pos)];
     let bestLen = 2;
     let bestDist = 0;
     let chain = 0;
+    let since = 0;
     const maxLen = Math.min(258, n - pos);
     while (cand >= 0 && chain < maxChain) {
       const dist = pos - cand;
       if (dist > 32768) break;
       chain++;
+      let improved = false;
       // Quick reject: the byte at the current best length must match.
       if (data[cand + bestLen] === data[pos + bestLen]) {
         let len = 0;
@@ -977,11 +1006,35 @@ class Matcher {
           bestLen = len;
           bestDist = dist;
           this.pareto[this.paretoCount++] = len;
+          improved = true;
           if (len === 258) break;
+          if (earlyCap > 0 && bestLen >= earlyCap) break;
         }
       }
-      cand = this.prev[cand];
+      if (improved) since = 0;
+      else if (stagCap > 0 && ++since >= stagCap) break;
+      cand = prevArr[cand];
     }
+    return [bestLen, bestDist];
+  }
+  bestSublen(pos: number, maxChain: number, sublen: Int32Array, stagCap = 0, earlyCap = 0): Match | null {
+    const data = this.data;
+    const n = data.length;
+    if (pos + 3 > n) return null;
+    this.insertUpTo(pos);
+    this.paretoCount = 0;
+    // Four-byte chain first: every candidate there shares four bytes, so
+    // any improvement is a length-4 (or longer) match. When one is found
+    // the three-byte walk is skipped — a position sharing only three bytes
+    // can only give a length-3 match, and the DP's length-3 edge is
+    // already served by the four-byte candidate's distance (sublen[3]
+    // is filled by the improvement loop below). When no length-4 match
+    // exists, fall through to the three-byte chain for length-3 matches.
+    if (pos + 3 < n) {
+      const [l4, d4] = this.walkChain(this.head4[hash4(data, pos)], pos, maxChain, sublen, this.prev4, stagCap, earlyCap);
+      if (l4 >= 4) return { len: l4, dist: d4 };
+    }
+    const [bestLen, bestDist] = this.walkChain(this.head[hash3(data, pos)], pos, maxChain, sublen, this.prev, stagCap, earlyCap);
     return bestLen >= 3 ? { len: bestLen, dist: bestDist } : null;
   }
 }
@@ -1135,6 +1188,30 @@ function parseOptimal(
   const choice = new Int32Array(n + 1); // 0 = literal, else match length
   const choiceDist = new Int32Array(n + 1);
   costs[0] = 0;
+  // Iter 9: chain-walk shortcuts apply ONLY to the all-candidates pass.
+  // There every position is a candidate, so a match missed at one
+  // position is usually found one byte later; the seed/plus-8 passes run
+  // uncapped (their deep-chain matches are the lazy seed's tokens — see
+  // walkChain). Stagnation cap 32 measured: all-pass ~2x faster for
+  // -0.52 total-score points on practice (see NOTES iter 9).
+  // Iter 10: stagnation cap 32 -> 20 (the all-pass was ~10s of the
+  // iter-9 local run; a tighter cap trades a few hundred bytes for
+  // the wall time the slower grader needs).
+  const stagCap = candMode === 'all' ? 20 : 0;
+  const earlyCap = 0;
+  // Iter 9: precomputed per-length / per-distance bit costs, inlining
+  // matchCost (its table lookups plus a call per DP edge) out of the
+  // inner loop.
+  const lcBits = new Float64Array(259);
+  for (let l = 3; l <= 258; l++) {
+    const lc = LEN_CODE_TABLE[l];
+    lcBits[l] = litLen[257 + lc] + LEN_EXTRA[lc];
+  }
+  const dcBits = new Float64Array(32769);
+  for (let d = 1; d <= 32768; d++) {
+    const dc = DIST_CODE_TABLE[d];
+    dcBits[d] = distLen[dc] + DIST_EXTRA[dc];
+  }
   const sublen = new Int32Array(259);
   matcher.reset();
   for (let i = 0; i < n; i++) {
@@ -1147,7 +1224,7 @@ function parseOptimal(
       choice[i + 1] = 0;
     }
     if (!cand[i] || i + 3 > n) continue;
-    const m = matcher.bestSublen(i, maxChain, sublen);
+    const m = matcher.bestSublen(i, maxChain, sublen, stagCap, earlyCap);
     if (!m) continue;
     // Pareto lengths: for each distinct distance the largest length
     // reaching it, plus each length-code bucket's two ends. Inside one
@@ -1161,7 +1238,7 @@ function parseOptimal(
     for (let k = 0; k < matcher.paretoCount; k++) {
       const l = matcher.pareto[k];
       const d = sublen[l];
-      const c = ci + matchCost(l, d, litLen, distLen);
+      const c = ci + lcBits[l] + dcBits[d];
       if (c < costs[i + l]) {
         costs[i + l] = c;
         choice[i + l] = l;
@@ -1174,7 +1251,7 @@ function parseOptimal(
       const hi = b + 1 < 29 ? LEN_BASE[b + 1] - 1 : 258;
       const lenHi = Math.min(m.len, hi);
       const dHi = sublen[lenHi];
-      const cHi = ci + matchCost(lenHi, dHi, litLen, distLen);
+      const cHi = ci + lcBits[lenHi] + dcBits[dHi];
       if (cHi < costs[i + lenHi]) {
         costs[i + lenHi] = cHi;
         choice[i + lenHi] = lenHi;
@@ -1182,7 +1259,7 @@ function parseOptimal(
       }
       if (base >= 3 && base !== lenHi) {
         const dLo = sublen[base];
-        const cLo = ci + matchCost(base, dLo, litLen, distLen);
+        const cLo = ci + lcBits[base] + dcBits[dLo];
         if (cLo < costs[i + base]) {
           costs[i + base] = cLo;
           choice[i + base] = base;
@@ -1848,8 +1925,8 @@ function encodeBest(tokens: Tokens, data: Buffer, allowSplit = true): Buffer {
 // Measured on practice fi=0 streams: -1835B total for ~4.2s at 12 rounds
 // (vs -2443B for the exhaustive all-rows split at ~50s). Skipped for huge streams,
 // where a 5th parse pass buys far more per second.
-// The full custom DEFLATE (iter 6): four passes — two lazy parses, then
-// two optimal parses — plus, per stream size class, either an extra
+// The full custom DEFLATE (iter 9): one lazy parse, then one or two
+// optimal parses — plus, per stream size class, either an extra
 // all-candidates optimal pass (screened total > 70000, where mid-match
 // positions win thousands of bytes) or plus-8 candidates on the last
 // optimal pass (smaller streams: gains everywhere, cheap; i007 even beats
@@ -1945,23 +2022,28 @@ function customDeflate(data: Buffer, allChain: number, huge = false): Buffer | n
     let distLen: Uint8Array = FIXED_DIST_LEN;
     let tokens: Tokens | null = null;
     let lazyTokens: Tokens | null = null;
-    // Iter 7: huge streams get a 5th parse pass (i006: -830B for +2.9s;
-    // i003/i004 gain nothing from it, so it stays gated).
-    // FIX-1938 FIX-FULL: drop the last optimal pass everywhere
-    // (passes 4->3, huge 5->4) — expC measured -5.4s for -1.06 pts.
+    // Iter 9: ONE lazy pass (chain 1024) then the optimal passes
+    // (passes-2 of them: 1 normally, 2 for huge streams). The second lazy
+    // pass was redundant: with a single chain-1024 lazy pass the final
+    // tokens are byte-identical on 4 of 5 big practice streams and +16B
+    // on the fifth (probe iter 9), for ~2.2s saved across the set.
     const passes = huge ? 4 : 3;
+    const nOpt = passes - 2;
     // Iter 8b: seed optimal passes at chain 1024 when an all-pass follows
     // (probeL: -495B and -4.4s on the four big streams — the all-pass
     // re-explores from the seed, so a shorter seed chain wins); plus-8
     // streams keep 4096 (probeM: seed1024 costs +337..+1242B there).
-    const seedChain = allChain > 0 ? 1024 : 4096;
-    for (let p = 0; p < passes; p++) {
-      if (p >= 2) {
-        tokens = parseOptimal(data, matcher, litLen, distLen, seedChain, tokens!, allChain === 0 && p === passes - 1 ? 'plus8' : undefined);
-      } else {
-        tokens = parseData(data, matcher, litLen, distLen, p === 0 ? 32 : (allChain > 0 ? 1024 : 4096), false); // FIX-1938: lazy p1 4096->1024 on all-pass streams only
-      }
-      if (p === 1) lazyTokens = tokens;
+    // Iter 10: seed chains cut (1024 -> 512 ahead of an all-pass,
+    // 4096 -> 1024 for plus-8 streams). The grader's CPU is >=1.55x
+    // slower than this machine and iter-9 (30s local) timed out there;
+    // the plus-8 pass at chain 4096 alone cost ~6.6s of the local run.
+    const seedChain = allChain > 0 ? 512 : 1024;
+    tokens = parseData(data, matcher, litLen, distLen, 1024, false);
+    lazyTokens = tokens;
+    litLen = buildLengths(tokens.litFreq, 15);
+    distLen = buildLengths(tokens.distFreq, 15);
+    for (let q = 0; q < nOpt; q++) {
+      tokens = parseOptimal(data, matcher, litLen, distLen, seedChain, tokens!, allChain === 0 && q === nOpt - 1 ? 'plus8' : undefined);
       litLen = buildLengths(tokens.litFreq, 15);
       distLen = buildLengths(tokens.distFreq, 15);
     }
@@ -2087,7 +2169,7 @@ function writePng(form: Form, zlibStream: Buffer): Buffer {
 // optimal-parse DEFLATE runs only on the best-screened finalist; the rest
 // get zlib level 9 only. That keeps the whole set inside the 60-second
 // wall budget on one CPU.
-// Iter 8: two phases — screen every instance first, then compress.
+// Iter 9: screen and compress one instance at a time (see main()).
 // FIX-1938: the chain-1024 cap is retired; chains are smaller across the
 // board (128/512/512) so the worst-case wall time stays bounded; the
 // assignment is a pure function of the screened totals, so runs stay
@@ -2096,15 +2178,6 @@ function main(): void {
   const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
   const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
   const ids = readdirSync(inputDir).sort();
-  const jobs: { id: string; an: Analysis; finalists: { form: Form; filtered: Buffer; total: number }[] }[] = [];
-  for (const id of ids) {
-    const inFile = join(inputDir, id, 'image.png');
-    const decoded = decodePng(readFileSync(inFile));
-    if (decoded.width !== W || decoded.height !== H) fail(id + ': unexpected size');
-    const an = analyse(decoded.rgba);
-    const forms = candidateForms(decoded.rgba, an);
-    jobs.push({ id, an, finalists: pickFinalists(forms) });
-  }
   const chainFor = (total: number, ct: number): number => {
     // FIX-1938: i006 512->128, i003 256->128 (restored from 64: brute-gate
     // savings fund it), i002 1024->512, i004 stays 512 (chain-1024 cap
@@ -2114,12 +2187,25 @@ function main(): void {
     if (total > 40000) return ct === 6 ? 0 : 512; // ct6 stays plus8 (i007: all-pass costs ~9s for ~273B)
     return 0;
   };
-  for (const job of jobs) {
+  // Iter 9: screen and compress one instance at a time, then drop its
+  // buffers before the next instance. The old two-phase layout (screen
+  // all eight, then compress) held every instance's filtered streams and
+  // forms at once and peaked near 470 MB RSS on this machine — close to
+  // the grader's 512 MB. Per-instance decisions depend only on that
+  // instance, so interleaving is byte-identical and cuts peak RSS to
+  // roughly one instance's working set.
+  for (const id of ids) {
+    const inFile = join(inputDir, id, 'image.png');
+    const decoded = decodePng(readFileSync(inFile));
+    if (decoded.width !== W || decoded.height !== H) fail(id + ': unexpected size');
+    const an = analyse(decoded.rgba);
+    const forms = candidateForms(decoded.rgba, an);
+    const finalists = pickFinalists(forms);
     let png: Buffer | null = null;
     let winType = -1;
-    const f0total = job.finalists[0].total;
-    for (let fi = 0; fi < job.finalists.length; fi++) {
-      const cand = job.finalists[fi];
+    const f0total = finalists[0].total;
+    for (let fi = 0; fi < finalists.length; fi++) {
+      const cand = finalists[fi];
       // Iter 8: skip trailing finalists (screened lag > 500). On practice
       // their zlib-9 can never beat the fi=0 custom (smallest margin
       // 813B); keeping only the close ones saves ~2.0s.
@@ -2139,12 +2225,12 @@ function main(): void {
         winType = cand.form.colourType;
       }
     }
-    const outDir = join(outputDir, job.id);
+    const outDir = join(outputDir, id);
     mkdirSync(outDir, { recursive: true });
     writeFileSync(join(outDir, 'image.png'), png!);
     process.stderr.write(
-      `${job.id}: type=${winType} bytes=${png!.length} ` +
-        `(colours=${job.an.colours ? job.an.colours.length : '>256'} grey=${job.an.isGrey} opaque=${job.an.allOpaque})\n`,
+      `${id}: type=${winType} bytes=${png!.length} ` +
+        `(colours=${an.colours ? an.colours.length : '>256'} grey=${an.isGrey} opaque=${an.allOpaque})\n`,
     );
   }
 }
