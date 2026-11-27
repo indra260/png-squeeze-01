@@ -620,7 +620,12 @@ function pickFinalists(forms: Form[]): { form: Form; filtered: Buffer; total: nu
       bestForm = c.form;
     }
   }
-  if (bestForm) {
+  // FIX-1938: brute screening only when the cheap-best total is large.
+  // On practice brute changes fi=0 only on i003/i004 (both >100K screened);
+  // the other six streams are byte-identical without it (nobrute test:
+  // -4.2s for +904B i003 / +3583B i004 only). Gate at 70000 sits between
+  // the largest unaffected stream (~58K) and the smallest affected (~106K).
+  if (bestForm && bestTotal > 70000) {
     const screened = screenForm(bestForm, 'brute');
     all.push({ form: bestForm, filtered: screened.filtered, total: screened.total, strat: 'brute' });
   }
@@ -1103,6 +1108,8 @@ function parseOptimal(
   //  seed2 = seed token boundaries +1/+2 (baseline);
   //  plusK = seed2 plus K positions after each long (>=16) match token;
   //  all   = every position is a candidate.
+  //  strideS = seed2 plus every S-th position (FIX-1938: cheap stand-in
+  //  for 'all' — DP restarts land within S-1 bytes of the optimum).
   const candMode = candOverride ?? 'seed2';
   const cand = new Uint8Array(n + 1);
   if (candMode === 'all') {
@@ -1118,6 +1125,10 @@ function parseOptimal(
         for (let k = 3; k <= extra && covered + k <= n; k++) cand[covered + k] = 1;
       }
       covered += seed.kind[i] === 0 ? 1 : seed.a[i];
+    }
+    if (candMode.startsWith('stride')) {
+      const s = Number(candMode.slice(6)) || 16;
+      for (let i = 0; i <= n; i += s) cand[i] = 1;
     }
   }
   const costs = new Float64Array(n + 1).fill(Infinity);
@@ -1936,7 +1947,9 @@ function customDeflate(data: Buffer, allChain: number, huge = false): Buffer | n
     let lazyTokens: Tokens | null = null;
     // Iter 7: huge streams get a 5th parse pass (i006: -830B for +2.9s;
     // i003/i004 gain nothing from it, so it stays gated).
-    const passes = huge ? 5 : 4;
+    // FIX-1938 FIX-FULL: drop the last optimal pass everywhere
+    // (passes 4->3, huge 5->4) — expC measured -5.4s for -1.06 pts.
+    const passes = huge ? 4 : 3;
     // Iter 8b: seed optimal passes at chain 1024 when an all-pass follows
     // (probeL: -495B and -4.4s on the four big streams — the all-pass
     // re-explores from the seed, so a shorter seed chain wins); plus-8
@@ -1946,7 +1959,7 @@ function customDeflate(data: Buffer, allChain: number, huge = false): Buffer | n
       if (p >= 2) {
         tokens = parseOptimal(data, matcher, litLen, distLen, seedChain, tokens!, allChain === 0 && p === passes - 1 ? 'plus8' : undefined);
       } else {
-        tokens = parseData(data, matcher, litLen, distLen, p === 0 ? 32 : 4096, false);
+        tokens = parseData(data, matcher, litLen, distLen, p === 0 ? 32 : (allChain > 0 ? 1024 : 4096), false); // FIX-1938: lazy p1 4096->1024 on all-pass streams only
       }
       if (p === 1) lazyTokens = tokens;
       litLen = buildLengths(tokens.litFreq, 15);
@@ -2074,11 +2087,11 @@ function writePng(form: Form, zlibStream: Buffer): Buffer {
 // optimal-parse DEFLATE runs only on the best-screened finalist; the rest
 // get zlib level 9 only. That keeps the whole set inside the 60-second
 // wall budget on one CPU.
-// Iter 8: two phases — screen every instance first, then compress. The
-// chain-1024 all-pass is capped to a single stream per run (the eligible
-// stream with the largest screened total), which bounds the worst-case
-// wall time on unseen sets; the assignment is a pure function of the
-// screened totals, so runs stay byte-identical.
+// Iter 8: two phases — screen every instance first, then compress.
+// FIX-1938: the chain-1024 cap is retired; chains are smaller across the
+// board (128/512/512) so the worst-case wall time stays bounded; the
+// assignment is a pure function of the screened totals, so runs stay
+// byte-identical.
 function main(): void {
   const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
   const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -2092,21 +2105,13 @@ function main(): void {
     const forms = candidateForms(decoded.rgba, an);
     jobs.push({ id, an, finalists: pickFinalists(forms) });
   }
-  const eligible = jobs.filter((j) => {
-    const t = j.finalists[0].total;
-    return t > 40000 && t <= 70000 && j.finalists[0].form.colourType !== 6;
-  });
-  eligible.sort(
-    (a, b) => b.finalists[0].total - a.finalists[0].total || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
-  );
-  const chain1024Id = eligible.length ? eligible[0].id : null;
-  const chainFor = (total: number, ct: number, id: string): number => {
-    if (total > 150000) return 512;
-    if (total > 70000) return ct !== 6 ? 512 : 256;
-    if (total > 40000) {
-      if (ct === 6) return 0;
-      return id === chain1024Id ? 1024 : 512;
-    }
+  const chainFor = (total: number, ct: number): number => {
+    // FIX-1938: i006 512->128, i003 256->128 (restored from 64: brute-gate
+    // savings fund it), i002 1024->512, i004 stays 512 (chain-1024 cap
+    // retired — see NOTES-FIX-20261127-1938).
+    if (total > 150000) return 128;
+    if (total > 70000) return ct !== 6 ? 512 : 128;
+    if (total > 40000) return ct === 6 ? 0 : 512; // ct6 stays plus8 (i007: all-pass costs ~9s for ~273B)
     return 0;
   };
   for (const job of jobs) {
@@ -2126,7 +2131,7 @@ function main(): void {
         cand.filtered,
         mode,
         cand.total,
-        fi === 0 ? chainFor(cand.total, cand.form.colourType, job.id) : 0,
+        fi === 0 ? chainFor(cand.total, cand.form.colourType) : 0,
       );
       const out = writePng(cand.form, stream);
       if (!png || out.length < png.length) {
